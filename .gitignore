@@ -1,0 +1,29 @@
+# Generated database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Generated metadata
+metadata.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+.pytest_cache/
+
+# Claude Code local overrides
+.claude/settings.local.json
+
+# Crawl checkpoints (temporary state for batch crawling)
+checkpoint_*.json
+
+# Phase 2 extraction cache (raw HTML archive + parsed extractions)
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
