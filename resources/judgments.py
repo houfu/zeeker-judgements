@@ -60,6 +60,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -81,8 +82,7 @@ from tenacity import (
 # which bypasses package imports — ``from resources import ...`` fails at
 # build time. Make sibling modules importable by adding this file's
 # directory to sys.path before importing them.
-import sys as _sys
-_sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import extraction  # noqa: E402
 import extraction_cache  # noqa: E402
 from extraction import ExtractionError  # noqa: E402
@@ -493,9 +493,7 @@ def _update_row(table: Table, jid: str, updates: Dict[str, Any]) -> None:
     cols = list(updates.keys())
     placeholders = ", ".join(f'"{c}" = ?' for c in cols)
     params = [updates[c] for c in cols] + [jid]
-    table.db.execute(
-        f'UPDATE "{table.name}" SET {placeholders} WHERE id = ?', params
-    )
+    table.db.execute(f'UPDATE "{table.name}" SET {placeholders} WHERE id = ?', params)
 
 
 def _insert_fragments(db, fragments: List[Dict[str, Any]]) -> int:
@@ -514,28 +512,34 @@ def _insert_fragments(db, fragments: List[Dict[str, Any]]) -> int:
     return db.conn.total_changes - before
 
 
-def _push_cached_extraction_to_db(
-    existing_table: Table, jid: str, cached: Dict[str, Any]
-) -> None:
+def _push_cached_extraction_to_db(existing_table: Table, jid: str, cached: Dict[str, Any]) -> None:
     """Update main row + insert fragments from an already-cached extraction."""
     if cached.get("extraction_status", "").startswith("empty"):
-        _update_row(existing_table, jid, {
-            "content_text": "",
-            "court_summary": "",
-            "has_content": 0,
-            "has_court_summary": 0,
-            "fragment_count": 0,
-            "extracted_at": cached.get("extracted_at") or "",
-        })
+        _update_row(
+            existing_table,
+            jid,
+            {
+                "content_text": "",
+                "court_summary": "",
+                "has_content": 0,
+                "has_court_summary": 0,
+                "fragment_count": 0,
+                "extracted_at": cached.get("extracted_at") or "",
+            },
+        )
         return
-    _update_row(existing_table, jid, {
-        "content_text": cached.get("content_text") or "",
-        "court_summary": cached.get("court_summary") or "",
-        "has_content": 1 if cached.get("has_content") else 0,
-        "has_court_summary": 1 if cached.get("has_court_summary") else 0,
-        "fragment_count": len(cached.get("fragments") or []),
-        "extracted_at": cached.get("extracted_at") or "",
-    })
+    _update_row(
+        existing_table,
+        jid,
+        {
+            "content_text": cached.get("content_text") or "",
+            "court_summary": cached.get("court_summary") or "",
+            "has_content": 1 if cached.get("has_content") else 0,
+            "has_court_summary": 1 if cached.get("has_court_summary") else 0,
+            "fragment_count": len(cached.get("fragments") or []),
+            "extracted_at": cached.get("extracted_at") or "",
+        },
+    )
     _insert_fragments(existing_table.db, cached.get("fragments") or [])
 
 
@@ -594,14 +598,18 @@ def _enrich_row(
             "extraction_status": f"empty: {exc}",
         }
         extraction_cache.write_extraction_atomic(jid, empty_payload)
-        _update_row(existing_table, jid, {
-            "content_text": "",
-            "court_summary": "",
-            "has_content": 0,
-            "has_court_summary": 0,
-            "fragment_count": 0,
-            "extracted_at": empty_iso,
-        })
+        _update_row(
+            existing_table,
+            jid,
+            {
+                "content_text": "",
+                "court_summary": "",
+                "has_content": 0,
+                "has_court_summary": 0,
+                "fragment_count": 0,
+                "extracted_at": empty_iso,
+            },
+        )
         return "empty", str(exc)
 
     now_iso = datetime.now().isoformat(timespec="seconds")
@@ -617,14 +625,18 @@ def _enrich_row(
     }
     extraction_cache.write_extraction_atomic(jid, payload)
 
-    _update_row(existing_table, jid, {
-        "content_text": extracted.content_text,
-        "court_summary": extracted.court_summary,
-        "has_content": 1 if extracted.has_content else 0,
-        "has_court_summary": 1 if extracted.has_court_summary else 0,
-        "fragment_count": len(extracted.fragments),
-        "extracted_at": now_iso,
-    })
+    _update_row(
+        existing_table,
+        jid,
+        {
+            "content_text": extracted.content_text,
+            "court_summary": extracted.court_summary,
+            "has_content": 1 if extracted.has_content else 0,
+            "has_court_summary": 1 if extracted.has_court_summary else 0,
+            "fragment_count": len(extracted.fragments),
+            "extracted_at": now_iso,
+        },
+    )
     _insert_fragments(existing_table.db, extracted.fragments)
     return "ok", (
         f"{len(extracted.fragments)} frags, "
@@ -663,9 +675,7 @@ def _run_phase2(
     # Query all rows with NULL content_text, ordered most recent first
     # (fresh judgments matter more to users; backfill oldest last).
     candidates: List[Dict[str, Any]] = list(
-        existing_table.rows_where(
-            "content_text IS NULL", order_by="decision_date DESC"
-        )
+        existing_table.rows_where("content_text IS NULL", order_by="decision_date DESC")
     )
     remaining_total = len(candidates)
     if remaining_total == 0:
@@ -702,7 +712,9 @@ def _run_phase2(
             except Exception as exc:  # defensive — should be rare
                 transient_failures += 1
                 _record_extraction_failure(state, jid, exc)
-                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → UNEXPECTED: {exc}", err=True)
+                click.echo(
+                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → UNEXPECTED: {exc}", err=True
+                )
                 save_extraction_state(state)
                 continue
 
@@ -884,9 +896,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         if exhausted:
             clear_checkpoint()
 
-        click.echo(
-            f"Discovery run complete: {len(staged)} new records, {breaker.summary()}"
-        )
+        click.echo(f"Discovery run complete: {len(staged)} new records, {breaker.summary()}")
 
         # Phase 2 runs inside the same client context so it reuses the
         # connection pool. Uses the breaker state from Phase 1 — if the

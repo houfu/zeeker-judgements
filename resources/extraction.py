@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -52,10 +51,23 @@ PARA_NUM_RE = re.compile(r"^(\d+)[\s\xa0\u2003]+(.*)$", re.DOTALL)
 TABLE_OPEN = "\n\n---table---\n"
 TABLE_CLOSE = "\n---end-table---\n"
 
+# eLitigation's mobile/web conversion preserves U+00A0 (non-breaking
+# space) and U+2003 (em-space) liberally — between paragraph numbers and
+# text, inside case names ("Smith\xa0v\xa0Jones"), inside dates, etc.
+# BS4's ``get_text`` does not normalize these, so they leak into
+# ``content_text`` and produce awkward copy-paste output plus subtly
+# different FTS tokenization.
+_WS_TRANSLATION = str.maketrans({"\xa0": " ", "\u2003": " "})
+
+
+def _normalize_ws(text: str) -> str:
+    return text.translate(_WS_TRANSLATION) if text else text
+
 
 # ---------------------------------------------------------------------------
 # Public types
 # ---------------------------------------------------------------------------
+
 
 class ExtractionError(Exception):
     """Raised when a judgment page lacks the required container."""
@@ -74,6 +86,7 @@ class ExtractedJudgment:
 # ---------------------------------------------------------------------------
 # Primitives (unit-testable in isolation)
 # ---------------------------------------------------------------------------
+
 
 def parse_paragraph_number(text: str) -> Tuple[Optional[int], str]:
     """Split a leading paragraph number from the rest of the text.
@@ -100,7 +113,7 @@ def absorb_table(table: Tag) -> str:
         cells = row.find_all(["td", "th"])
         if not cells:
             continue
-        line = " | ".join(cell.get_text(" ", strip=True) for cell in cells)
+        line = " | ".join(_normalize_ws(cell.get_text(" ", strip=True)) for cell in cells)
         if line.replace("|", "").strip():
             lines.append(line)
     if not lines:
@@ -119,7 +132,7 @@ def absorb_figure(img: Tag) -> Tuple[str, str]:
     text.
     """
     src = (img.get("src") or "").strip()
-    alt = (img.get("alt") or "").strip()
+    alt = _normalize_ws((img.get("alt") or "").strip())
     if src.startswith("data:"):
         digest = hashlib.sha256(src.encode("utf-8")).hexdigest()
         src = f"sha256:{digest}"
@@ -151,7 +164,7 @@ def extract_footnotes(soup: BeautifulSoup) -> Dict[str, str]:
         # but be explicit.
         if fid in {"divJudgement", "divCaseSummary", "divHeadMessage"}:
             continue
-        text = el.get_text(" ", strip=True)
+        text = _normalize_ws(el.get_text(" ", strip=True))
         if text:
             result[fid] = text
     return result
@@ -171,11 +184,7 @@ def collect_footnote_refs(element: Tag) -> List[str]:
     ids: List[str] = []
     for sup in element.find_all("sup"):
         for descendant in sup.find_all(["a", "button"]):
-            target = (
-                descendant.get("data-target")
-                or descendant.get("href")
-                or ""
-            ).strip()
+            target = (descendant.get("data-target") or descendant.get("href") or "").strip()
             if target.startswith("#"):
                 fid = target[1:]
                 if fid.startswith("fn") and fid not in ids:
@@ -186,6 +195,7 @@ def collect_footnote_refs(element: Tag) -> List[str]:
 # ---------------------------------------------------------------------------
 # Element content extraction
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class _ElementContent:
@@ -209,8 +219,11 @@ def _extract_element_content(element: Tag) -> _ElementContent:
     root = copy_soup.find(element.name)
     if root is None:
         # Defensive fallback — shouldn't happen for normal Judg-* divs.
-        return _ElementContent(text=element.get_text(" ", strip=True),
-                               has_table=False, has_figure=False)
+        return _ElementContent(
+            text=_normalize_ws(element.get_text(" ", strip=True)),
+            has_table=False,
+            has_figure=False,
+        )
 
     tables = list(root.find_all("table"))
     imgs = list(root.find_all("img"))
@@ -224,7 +237,7 @@ def _extract_element_content(element: Tag) -> _ElementContent:
     for i in imgs:
         i.decompose()
 
-    text = root.get_text(" ", strip=True)
+    text = _normalize_ws(root.get_text(" ", strip=True))
 
     for rendering in table_renderings:
         if rendering:
@@ -249,6 +262,7 @@ def _extract_element_content(element: Tag) -> _ElementContent:
 # ---------------------------------------------------------------------------
 # Fragment assembly
 # ---------------------------------------------------------------------------
+
 
 def _make_fragment(
     *,
@@ -281,9 +295,7 @@ def _make_fragment(
         "has_footnotes": has_footnotes,
         "has_table": has_table,
         "has_figure": has_figure,
-        "figure_src": (
-            json.dumps(figure_srcs, ensure_ascii=False) if figure_srcs else None
-        ),
+        "figure_src": (json.dumps(figure_srcs, ensure_ascii=False) if figure_srcs else None),
         "figure_descriptions": (
             json.dumps(figure_alts, ensure_ascii=False) if figure_alts else None
         ),
@@ -380,9 +392,7 @@ def extract_paragraphs(
             f["content_text"] = f["content_text"] + "\n\n" + alt
             f["has_figure"] = True
             existing_srcs = json.loads(f["figure_src"]) if f["figure_src"] else []
-            existing_alts = (
-                json.loads(f["figure_descriptions"]) if f["figure_descriptions"] else []
-            )
+            existing_alts = json.loads(f["figure_descriptions"]) if f["figure_descriptions"] else []
             existing_srcs.append(src)
             existing_alts.append(alt)
             f["figure_src"] = json.dumps(existing_srcs, ensure_ascii=False)
@@ -400,9 +410,7 @@ def extract_paragraphs(
             json.loads(fragment["figure_src"]) if fragment["figure_src"] else []
         )
         fig_alts: List[str] = list(
-            json.loads(fragment["figure_descriptions"])
-            if fragment["figure_descriptions"]
-            else []
+            json.loads(fragment["figure_descriptions"]) if fragment["figure_descriptions"] else []
         )
         for src, alt in pending_figures:
             prefix_text += "\n\n" + alt
@@ -427,24 +435,26 @@ def extract_paragraphs(
             heading_text = heading_content.text
             if heading_text:
                 current_heading = heading_text
-            fragments.append(_make_fragment(
-                judgment_id=judgment_id,
-                ordinal=len(fragments),
-                html_raw=html_raw,
-                class_name=class_name or "",
-                paragraph_number=None,
-                section_heading=None,
-                text=heading_text,
-                has_table=heading_content.has_table,
-                has_figure=heading_content.has_figure,
-                figure_srcs=heading_content.figure_srcs,
-                figure_alts=heading_content.figure_alts,
-                footnote_texts=[
-                    footnote_map[fid]
-                    for fid in collect_footnote_refs(node)
-                    if fid in footnote_map
-                ],
-            ))
+            fragments.append(
+                _make_fragment(
+                    judgment_id=judgment_id,
+                    ordinal=len(fragments),
+                    html_raw=html_raw,
+                    class_name=class_name or "",
+                    paragraph_number=None,
+                    section_heading=None,
+                    text=heading_text,
+                    has_table=heading_content.has_table,
+                    has_figure=heading_content.has_figure,
+                    figure_srcs=heading_content.figure_srcs,
+                    figure_alts=heading_content.figure_alts,
+                    footnote_texts=[
+                        footnote_map[fid]
+                        for fid in collect_footnote_refs(node)
+                        if fid in footnote_map
+                    ],
+                )
+            )
             continue
 
         if kind == "paragraph":
@@ -457,9 +467,7 @@ def extract_paragraphs(
                     paragraph_number = num
                     text = rest
             footnote_texts = [
-                footnote_map[fid]
-                for fid in collect_footnote_refs(node)
-                if fid in footnote_map
+                footnote_map[fid] for fid in collect_footnote_refs(node) if fid in footnote_map
             ]
             fragment = _make_fragment(
                 judgment_id=judgment_id,
@@ -498,6 +506,7 @@ def extract_paragraphs(
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
+
 def _compose_content_text(fragments: List[Dict[str, Any]]) -> str:
     """Concatenate fragments into a single plain-text judgment body.
 
@@ -521,7 +530,7 @@ def extract_court_summary(soup: BeautifulSoup) -> str:
     div = soup.find("div", id="divCaseSummary")
     if div is None:
         return ""
-    return div.get_text(" ", strip=True)
+    return _normalize_ws(div.get_text(" ", strip=True))
 
 
 def extract_judgment(html: str, judgment_id: str) -> ExtractedJudgment:

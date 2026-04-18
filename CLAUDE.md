@@ -78,12 +78,12 @@ When implementing resources that need external libraries:
 
 ### `judgments` Resource
 - **Description:** Singapore court judgments from eLitigation with paragraph-level search
-- **File:** `resources/judgments.py`
-- **Facets:** court, decision_date
+- **File:** `resources/judgments.py` (+ `extraction.py`, `extraction_cache.py`)
+- **Facets:** court, decision_date, has_content
 - **Default Sort:** decision_date desc
 - **Page Size:** 25
-- **Type:** Flat table in Phase 1 (fragments table deferred to Phase 2)
-- **Schema:** see `resources/judgments.py` `fetch_data()` and `zeeker.toml`
+- **Type:** Main table + `judgments_fragments` for paragraph-level search (populated by Phase 2)
+- **Schema:** see `zeeker.toml` `[resource.judgments.columns]` and `[resource.judgments_fragments.columns]`
 
 ## Project-Specific Notes
 
@@ -103,18 +103,23 @@ When implementing resources that need external libraries:
 
 ### Roadmap (phased)
 - **Phase 1 (DONE):** Discovery crawler — scrapes listing pages, persists
-  catalog metadata to `judgments`. Content columns (`content_text`,
-  `court_summary`, `summary`) are left NULL for later backfill.
-- **Phase 2 (not yet implemented):** HTML content extraction from the
-  detail page at `source_url` (NOT the PDF — see "Phase 2 design" below).
-  Populate `content_text` and `court_summary`. Enable `fragments = true`
-  in `zeeker.toml` and implement `fetch_fragments_data` to split numbered
-  paragraphs into `judgments_fragments`.
+  catalog metadata to `judgments`. Content columns stay NULL until Phase 2
+  backfill runs.
+- **Phase 2 (DONE):** HTML content extraction from the detail page at
+  `source_url` (NOT the PDF — see "Phase 2 design" below). Populates
+  `content_text` + `court_summary` on the main row and emits per-paragraph
+  rows into `judgments_fragments`. Runs in the **same** `fetch_data()`
+  invocation as Phase 1 (after discovery, before return), so there is one
+  resource, one build command, two phases per run. Default cap is 15 docs
+  per build — with a 10,588-doc backlog, expect hundreds of runs to drain.
+  Fragments are inserted inline from `fetch_data` (not via
+  `fetch_fragments_data`, which is a no-op stub); see the "Implementation
+  notes" subsection below for the why.
 - **Phase 3 (not yet implemented):** AI summaries — populate `summary`
   using an OpenAI-compatible LLM endpoint.
 - **Deployment (deferred):** No S3 workflow wired up yet. The
   auto-generated `.github/workflows/deploy.yml` is inert until secrets are
-  configured; ignore for Phase 1.
+  configured.
 
 ### Phase 2 design notes (HTML over PDF)
 
@@ -135,26 +140,51 @@ on HTML — no Docling infrastructure required.
   web-friendly. This may have created formatting or a[...]"* — surface this
   in the UI/README so readers know the PDF is authoritative.
 
-**`Judg-*` class map (stable across years/courts):**
+**`Judg-*` class map (stable across years/courts):** classification is
+**prefix-based** in code (`resources/extraction.py`) rather than a static
+whitelist, because eLitigation emits era-specific variants that aren't
+worth enumerating (observed: `Judg-1-firstpara`, `Judg-List-1` bare,
+`Judg-Quote-List`, `Judg-Hearing-Date`). Any class starting with `Judg-`
+becomes a fragment unless it's in `EXCLUDED_CLASSES` (currently just
+`Judg-EOF`, the end-of-document ornament).
+
 | Class | Role |
 |---|---|
-| `Judg-1` | Top-level numbered paragraph (number is first token, e.g. `"1 The Claimant..."`) |
-| `Judg-2` | Sub-paragraph |
-| `Judg-Heading-1` … `Judg-Heading-5` | Nested section headings |
-| `Judg-Quote-0/1/2`, `Judg-QuoteList-2` | Block quotations |
-| `Judg-List-1-No`, `Judg-List-1-Item` | Numbered-list entries |
-| `Judg-Author`, `Judg-Date-Reserved`, `Judg-Sign` | Front/back-matter |
-| `Judg-Lawyers` | Counsel block |
+| `Judg-1`, `Judg-1-firstpara` | Top-level numbered paragraph (arabic number is first token, e.g. `"1 The Claimant..."`). The **only** classes where `paragraph_number` is parseable. |
+| `Judg-2` | Sub-paragraph — uses alpha enumeration `(a)`, `(b)` in the text; no parseable paragraph number. |
+| `Judg-3` | Sub-sub-paragraph — roman numerals `(i)`, `(ii)`. |
+| `Judg-Heading-1` … `Judg-Heading-5` | Nested section headings. The most recent heading above a fragment becomes its `section_heading`. |
+| `Judg-Quote-0/1/2`, `Judg-Quote-List`, `Judg-QuoteList-*` | Block quotations. |
+| `Judg-List-1`, `Judg-List-1-No`, `Judg-List-1-Item` | Numbered-list entries. |
+| `Judg-Author`, `Judg-Date-Reserved`, `Judg-Hearing-Date`, `Judg-Sign` | Front/back-matter. |
+| `Judg-Lawyers` | Counsel block. |
+| `Judg-EOF` | Visual end marker — **excluded**, never produces a fragment. |
+
+**Backward-attachment anchors:** standalone tables/figures between
+paragraphs attach to the most recent Judg-1, Judg-1-firstpara, Judg-2,
+or Judg-3 fragment (not just Judg-1/2).
+
+**Walk strategy:** detail pages wrap content in a custom `<content>`
+element (and sometimes further wrappers) inside `div#divJudgement`, so
+Judg-* elements are at depth 3+, not direct children. The walker in
+`extraction.py` descends through non-Judg-* wrappers and yields Judg-*
+elements as leaves.
 
 **Paragraph-number parsing quirk:** the separator between the number and
 the paragraph text is a non-breaking space `\xa0` on older docs and an
 em-space `\u2003` on newer ones. Use `re.match(r"(\d+)[\s\xa0\u2003]+", text)`.
 
-**Footnotes:** inline references are `<sup>` tags in the paragraph;
-content lives in `div[id^="fn"]` elsewhere in the document (id may be
-`fn1` or a UUID like `fn-041fe0fc-fb3c-...`). Volume varies — 0 in older
-judgments, 100+ in long family-court ones. Capture footnote text into the
-fragment's `footnote_text` field and set `has_footnotes = true`.
+**Footnotes:** inline references are `<sup>` tags. Two markup variants in
+the wild:
+- Newer (2020+): `<sup><button data-target="#fn-<uuid>" data-toggle="modal">N</button></sup>`
+  — Bootstrap modal trigger; href lives in `data-target`.
+- Older: `<sup><a href="#fn1">N</a></sup>` — plain anchor.
+Both variants resolve to `div[id^="fn"]` elsewhere in the document (ids
+may be `fn1`, `fn2`, … or UUID-form `fn-041fe0fc-...`). Bare `<sup>`
+tags without a resolvable link (e.g. `<sup>[note: 1]</sup>` in ~2015-era
+docs) are kept in the paragraph text but not captured into
+`footnote_text`. Volume varies — 0 in older judgments, 100+ in long
+family-court ones.
 
 **Images and tables — attachment rule:** judgments embed tables and images
 both *inside* numbered paragraphs (e.g. a screenshot referenced mid-text)
@@ -192,52 +222,150 @@ handle both placements consistently:
 These are useful Datasette facets later (filter to paragraphs containing
 tables, e.g. "show me every judgment that has a damages schedule").
 
-**Env vars:** Phase 2 needs **none**. HTML extraction reuses the same
-`httpx.Client` from Phase 1. The `DOCLING_SERVE_URL` block can be dropped
-from `.env.example` when Phase 2 lands.
+### Phase 2 implementation notes (design deltas from the plan)
+
+A handful of choices diverged from the original "plan first, build later"
+sketch once we hit real code. Future-you should know about these:
+
+1. **Fragments are inserted inline from `fetch_data`, not via
+   `fetch_fragments_data`.** Zeeker skips the fragment pipeline entirely
+   when `fetch_data` returns no new main-table rows — which is the
+   steady-state case every daily build (Phase 1 finds nothing new; Phase 2
+   still wants to drain the enrichment backlog). So `_enrich_row` now
+   calls `_insert_fragments(db, extracted.fragments)` directly, same
+   transaction as the main-row `UPDATE`. `fetch_fragments_data` is a
+   `return []` no-op stub left in place to satisfy `fragments = true` in
+   `zeeker.toml`.
+
+2. **Direct SQL `UPDATE … WHERE id = ?` rather than
+   `sqlite_utils.Table.update()`.** Zeeker creates the `judgments` table
+   without a declared primary key (uses implicit rowid), so
+   `sqlite_utils`' `update(id_value, …)` raises `NotFoundError` — it
+   treats the arg as a rowid, not as our `id` column. We manage columns
+   (`_ensure_phase2_columns`) and updates (`_update_row`) in raw SQL.
+
+3. **`judgments_fragments` is created with an explicit schema.** Because
+   `fetch_fragments_data` is a stub, Zeeker's first-row schema inference
+   never fires. `_ensure_fragments_table` creates the table with
+   `pk="id"` up front (see `FRAGMENT_COLUMNS` in `resources/judgments.py`).
+
+4. **Env-var sentinel guards against zeeker's module reload.** When
+   `fragments = true`, zeeker re-imports the resource module and calls
+   `fetch_data` a second time to build `main_data_context`. Module-level
+   variables don't survive the reload, so `_JUDGMENTS_PHASE2_RAN_PID`
+   lives in `os.environ` (process-scoped, survives the reload, naturally
+   cleared across builds). Second call sees the matching PID and skips
+   Phase 2 entirely. Without this, every build would enrich
+   `2 × EXTRACT_MAX_PER_RUN` docs instead of the budgeted number.
+
+5. **Two-layer disk cache under `.cache/`** (gitignored):
+   - `.cache/judgments_html/{id}.html.gz` — raw detail-page HTML, gzipped.
+     Source of truth for re-extraction. If parsing rules change, delete
+     `.cache/judgments_extractions/` and re-run — no server traffic.
+   - `.cache/judgments_extractions/{id}.json` — parsed extraction output.
+     `_enrich_row` short-circuits on this: if the extraction JSON exists
+     (e.g. from a previous run that crashed after parsing but before the
+     DB write), it pushes straight to the DB without re-fetching or
+     re-parsing. Atomic writes (`tmp` + `os.replace`) prevent half-
+     written files on crash.
+
+6. **Failure quarantine.** `checkpoint_judgments_extraction.json` tracks
+   per-judgment failure count, last error, and last-attempt timestamp.
+   After `EXTRACT_MAX_RETRIES` failures a doc is quarantined for
+   `EXTRACT_RETRY_AFTER` seconds before the next attempt. This prevents
+   a single broken page from burning the whole daily budget.
+
+7. **Sibling-module import hack in `resources/judgments.py`.** Zeeker
+   loads resource files via `importlib.util.spec_from_file_location`,
+   which bypasses package imports — `from resources import extraction`
+   fails at build time. We prepend `Path(__file__).parent` to `sys.path`
+   before importing sibling modules.
+
+**Env vars (Phase 2):** set `JUDGMENTS_EXTRACT_ENABLED=0` to skip Phase 2
+entirely (useful during the initial Phase-1 archive crawl). The rest are
+in the knob table below.
 
 ### Environment variables
-Phase 1 needs **none** — the listing scraper is a pure public-HTML crawl.
-See `.env.example` for the variables that will light up in Phase 2 / 3 /
-deployment.
+Phase 1 + 2 need **none** for correctness — both are public-HTML crawls
+reusing the same `httpx.Client`. See `.env.example` for the variables
+that light up in Phase 3 / deployment.
 
-The crawler has a few operational knobs that default via env vars (handy
-for smoke tests — no code edits required):
+The resource has a handful of operational knobs that default via env
+vars (handy for smoke tests — no code edits required):
 
 | Env var | Default | What it controls |
 |---|---|---|
-| `JUDGMENTS_MAX_PAGES_PER_RUN` | `50` | Batch cap on listing pages per invocation. Set to `2` for smoke tests. |
-| `JUDGMENTS_INCREMENTAL_STOP` | `5` | Consecutive already-known IDs before early exit. |
-| `JUDGMENTS_DELAY_BASE` | `1.5` | Base sleep (s) between page fetches. |
-| `JUDGMENTS_DELAY_JITTER` | `0.5` | +/- jitter added to the base sleep. |
+| `JUDGMENTS_MAX_PAGES_PER_RUN` | `50` | Phase 1: batch cap on listing pages per invocation. Set to `2` for smoke tests. |
+| `JUDGMENTS_INCREMENTAL_STOP` | `5` | Phase 1: consecutive already-known IDs before early exit. |
+| `JUDGMENTS_DELAY_BASE` | `1.5` | Phase 1: base sleep (s) between listing-page fetches. |
+| `JUDGMENTS_DELAY_JITTER` | `0.5` | Phase 1: +/- jitter added to the base sleep. |
+| `JUDGMENTS_EXTRACT_ENABLED` | `1` | Phase 2: set to `0` to run discovery only (skip enrichment). |
+| `JUDGMENTS_EXTRACT_MAX_PER_RUN` | `15` | Phase 2: max docs enriched per `zeeker build`. |
+| `JUDGMENTS_EXTRACT_MAX_RETRIES` | `3` | Phase 2: failures before a doc is quarantined. |
+| `JUDGMENTS_EXTRACT_RETRY_AFTER` | `86400` | Phase 2: quarantine TTL in seconds (default 24h). |
+| `JUDGMENTS_EXTRACT_DELAY_BASE` | `1.5` | Phase 2: base sleep (s) between detail-page fetches. |
+| `JUDGMENTS_EXTRACT_DELAY_JITTER` | `0.5` | Phase 2: +/- jitter on the sleep. |
 
 ### Operational notes
-- **Checkpointing:** state lives in `checkpoint_judgments_discovery.json`
-  (gitignored). Resumes mid-archive across many runs; gets cleared
-  automatically when the archive is exhausted OR when the daily incremental
-  stop fires.
-- **Batch-crawl pacing:** at defaults, ~50 pages ≈ 75s sleep + fetch/parse.
-  Each run lands ~500 new records; ~22 runs cover the full archive.
-- **Politeness:** single `httpx.Client` connection pool, jittered 1–2s
-  delay, 3-retry tenacity backoff, 5-failure circuit breaker with 60s
-  cooldown. User-Agent identifies the bot.
-- **Build:** `uv run zeeker build judgments`. Re-invoke the same command to
-  continue a batch crawl (checkpoint drives resume).
-- **zeeker quirk:** when `fragments = true` in `zeeker.toml`, zeeker
-  invokes `fetch_data()` twice (once for insert, again for fragment
-  context) and reloads the module between calls, defeating any
-  module-level cache. Phase 1 dodges this by keeping `fragments = false`
-  until Phase 2 actually produces fragments.
+- **Phase 1 checkpointing:** state lives in
+  `checkpoint_judgments_discovery.json` (gitignored). Resumes mid-archive
+  across many runs; cleared automatically when the archive is exhausted
+  OR when the daily incremental stop fires.
+- **Phase 2 checkpointing:** failure state in
+  `checkpoint_judgments_extraction.json` (gitignored). The **real**
+  progress signal for enrichment is the DB query
+  `SELECT COUNT(*) FROM judgments WHERE content_text IS NULL` — whatever
+  isn't enriched yet still has NULL content. The checkpoint only tracks
+  what's been *tried and failed*.
+- **Batch-crawl pacing (Phase 1):** at defaults, ~50 pages ≈ 75s sleep +
+  fetch/parse. Each run lands ~500 new records; ~22 runs cover the full
+  archive.
+- **Enrichment pacing (Phase 2):** at defaults, ~15 docs ≈ 25s per run.
+  With a 10,588-doc backlog expect ~700 runs to drain. Set
+  `JUDGMENTS_EXTRACT_MAX_PER_RUN` higher if the source is cooperating,
+  lower (or `0` via `JUDGMENTS_EXTRACT_ENABLED=0`) if it's flaky.
+- **Politeness:** single `httpx.Client` connection pool shared across
+  phases, jittered 1–2s delay, 3-retry tenacity backoff, 5-failure
+  circuit breaker with 60s cooldown. User-Agent identifies the bot. If
+  Phase 1 trips the breaker, Phase 2 is skipped for that run (no point
+  hammering a source that's already failing).
+- **Build:** `uv run zeeker build judgments`. Re-invoke the same command
+  to continue a batch crawl (checkpoint drives resume) and/or drain
+  more of the enrichment backlog.
+- **zeeker quirk (dodged in Phase 2):** when `fragments = true` in
+  `zeeker.toml`, zeeker reloads the module and calls `fetch_data` a
+  second time to build fragment context. Our env-var sentinel
+  (`_JUDGMENTS_PHASE2_RAN_PID`) makes the second call skip Phase 2.
 
 ### Smoke test playbook
-1. `rm -f zeeker-judgements.db checkpoint_judgments_discovery.json`
-2. `JUDGMENTS_MAX_PAGES_PER_RUN=2 JUDGMENTS_DELAY_BASE=1.0 uv run zeeker build judgments`
-   — expect 20 records staged from pages 1–2.
+**Phase 1 (discovery only):**
+1. `rm -f zeeker-judgements.db checkpoint_judgments_discovery.json && rm -rf .cache/`
+2. `JUDGMENTS_EXTRACT_ENABLED=0 JUDGMENTS_MAX_PAGES_PER_RUN=2 JUDGMENTS_DELAY_BASE=1.0 uv run zeeker build judgments`
+   — expect 20 records staged from pages 1–2, no `.cache/` created.
 3. Re-run the same command — should resume from page 3, add 20 more
    records (40 total in DB), advance checkpoint to `last_page=4`.
 4. Delete the checkpoint and re-run — the crawler should hit 5 known IDs
    on page 1 and exit in under a second ("steady-state mode"), then clear
    the checkpoint automatically.
+
+**Phase 2 (enrichment) — run on top of step 4:**
+1. `JUDGMENTS_EXTRACT_MAX_PER_RUN=3 uv run zeeker build judgments`
+   — expect Phase 1 to hit steady-state on page 1, then Phase 2 to
+   extract 3 judgments. `.cache/judgments_html/` and
+   `.cache/judgments_extractions/` each get 3 files; `judgments` has 3
+   rows with `has_content=1`; `judgments_fragments` is created and
+   populated.
+2. Re-run — picks 3 **different** docs (the NULL-content query skips
+   the already-enriched rows).
+3. Resume test: `rm -rf .cache/judgments_html/` then re-run — expect HTML
+   to be re-fetched from server but DB state unchanged (extraction cache
+   still pushes already-parsed rows).
+4. Rule-change test: `rm -rf .cache/judgments_extractions/` (keep the
+   HTML archive), reset a few rows with `UPDATE judgments SET
+   content_text=NULL WHERE id IN (…)`, re-run — expect parsing from
+   archived HTML, no server traffic.
+
+**Unit + fixture tests:** `uv run pytest tests/` (39 tests, ~0.3s).
 
 ### Data source notes
 - Catchwords (`subject_tags`) are hierarchical: `Subject — Topic — Sub —

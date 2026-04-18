@@ -31,6 +31,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # parse_paragraph_number
 # ---------------------------------------------------------------------------
 
+
 class TestParseParagraphNumber:
     def test_non_breaking_space_separator(self):
         # Older judgments use U+00A0 between the number and text.
@@ -69,14 +70,13 @@ class TestParseParagraphNumber:
 # absorb_table
 # ---------------------------------------------------------------------------
 
+
 class TestAbsorbTable:
     def _table(self, html: str):
         return BeautifulSoup(html, "lxml").find("table")
 
     def test_simple_table_renders_pipe_separated(self):
-        t = self._table(
-            "<table><tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></table>"
-        )
+        t = self._table("<table><tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></table>")
         out = absorb_table(t)
         assert "---table---" in out
         assert "---end-table---" in out
@@ -92,9 +92,7 @@ class TestAbsorbTable:
         assert absorb_table(t) == ""
 
     def test_headers_and_body_both_captured(self):
-        t = self._table(
-            "<table><tr><th>Col</th></tr><tr><td>Val</td></tr></table>"
-        )
+        t = self._table("<table><tr><th>Col</th></tr><tr><td>Val</td></tr></table>")
         out = absorb_table(t)
         assert "Col" in out
         assert "Val" in out
@@ -103,6 +101,7 @@ class TestAbsorbTable:
 # ---------------------------------------------------------------------------
 # absorb_figure
 # ---------------------------------------------------------------------------
+
 
 class TestAbsorbFigure:
     def _img(self, html: str):
@@ -135,6 +134,7 @@ class TestAbsorbFigure:
 # collect_footnote_refs
 # ---------------------------------------------------------------------------
 
+
 class TestFootnoteRefs:
     def test_bootstrap_modal_button_variant(self):
         # Newer judgments wrap the marker in a Bootstrap modal trigger.
@@ -163,15 +163,14 @@ class TestFootnoteRefs:
 
     def test_bare_sup_is_ignored(self):
         # A plain superscript number has no resolvable target.
-        p = BeautifulSoup(
-            '<div class="Judg-1">Text<sup>[note: 1]</sup></div>', "lxml"
-        ).find("div")
+        p = BeautifulSoup('<div class="Judg-1">Text<sup>[note: 1]</sup></div>', "lxml").find("div")
         assert collect_footnote_refs(p) == []
 
 
 # ---------------------------------------------------------------------------
 # extract_footnotes
 # ---------------------------------------------------------------------------
+
 
 class TestExtractFootnotes:
     def test_fn_prefix_divs_are_collected(self):
@@ -186,8 +185,7 @@ class TestExtractFootnotes:
 
     def test_non_fn_divs_ignored(self):
         soup = BeautifulSoup(
-            '<div id="divJudgement">x</div>'
-            '<div id="sidebar">noise</div>',
+            '<div id="divJudgement">x</div>' '<div id="sidebar">noise</div>',
             "lxml",
         )
         assert extract_footnotes(soup) == {}
@@ -197,6 +195,7 @@ class TestExtractFootnotes:
 # extract_judgment — error path
 # ---------------------------------------------------------------------------
 
+
 def test_missing_div_judgement_raises():
     with pytest.raises(ExtractionError):
         extract_judgment("<html><body>no container</body></html>", "abc123")
@@ -205,6 +204,7 @@ def test_missing_div_judgement_raises():
 # ---------------------------------------------------------------------------
 # Synthetic attachment rule tests
 # ---------------------------------------------------------------------------
+
 
 def _extract_from_divj(inner_html: str, judgment_id: str = "t1"):
     html = f'<html><body><div id="divJudgement">{inner_html}</div></body></html>'
@@ -278,7 +278,7 @@ class TestHeadingContext:
 class TestCaseSummary:
     def test_empty_div_case_summary_marks_has_court_summary_false(self):
         html = (
-            '<html><body>'
+            "<html><body>"
             '<div id="divJudgement">'
             '<div class="Judg-1">1\xa0Body.</div>'
             "</div>"
@@ -291,7 +291,7 @@ class TestCaseSummary:
 
     def test_populated_div_case_summary_captured(self):
         html = (
-            '<html><body>'
+            "<html><body>"
             '<div id="divJudgement"><div class="Judg-1">1\xa0Body.</div></div>'
             '<div id="divCaseSummary">Important headnote text.</div>'
             "</body></html>"
@@ -315,9 +315,9 @@ def test_fixture_extracts_cleanly(fixture_path: Path):
     ej = extract_judgment(html, fixture_path.stem)
     assert ej.has_content is True, f"{fixture_path.name} produced no content"
     assert ej.content_text.strip(), f"{fixture_path.name} content_text is blank"
-    assert any(f["paragraph_number"] == 1 for f in ej.fragments), (
-        f"{fixture_path.name} has no '1' paragraph"
-    )
+    assert any(
+        f["paragraph_number"] == 1 for f in ej.fragments
+    ), f"{fixture_path.name} has no '1' paragraph"
     # Ordinals must be strictly ascending and unique.
     ords = [f["ordinal"] for f in ej.fragments]
     assert ords == list(range(len(ej.fragments)))
@@ -360,3 +360,95 @@ def test_fragment_html_raw_preserved():
     assert para1["html_raw"].startswith("<div")
     assert "Judg-1" in para1["html_raw"]
     assert "1" in para1["html_raw"]
+
+
+# ---------------------------------------------------------------------------
+# Whitespace normalization
+# ---------------------------------------------------------------------------
+
+
+class TestWhitespaceNormalization:
+    """Fragment content_text must not leak U+00A0 / U+2003 from the source."""
+
+    def test_nbsp_stripped_from_content_text(self):
+        ej = _extract_from_divj('<div class="Judg-1">1\xa0Smith\xa0v\xa0Jones\xa0(2025).</div>')
+        assert "\xa0" not in ej.fragments[0]["content_text"]
+        assert "Smith v Jones" in ej.fragments[0]["content_text"]
+
+    def test_em_space_stripped(self):
+        ej = _extract_from_divj(
+            '<div class="Judg-Date-Reserved">16 April 2026\u2003Judgment reserved.</div>'
+        )
+        assert "\u2003" not in ej.fragments[0]["content_text"]
+
+    def test_court_summary_normalized(self):
+        html = (
+            "<html><body>"
+            '<div id="divJudgement"><div class="Judg-1">1\xa0Body.</div></div>'
+            '<div id="divCaseSummary">Headnote\xa0with\xa0nbsp.</div>'
+            "</body></html>"
+        )
+        ej = extract_judgment(html, "x")
+        assert "\xa0" not in ej.court_summary
+        assert ej.court_summary == "Headnote with nbsp."
+
+    def test_footnote_text_normalized(self):
+        html = (
+            "<html><body>"
+            '<div id="divJudgement">'
+            '<div class="Judg-1">1\xa0Ref<sup><a href="#fn1">1</a></sup>.</div>'
+            "</div>"
+            '<div id="fn1">Foot Note\xa01\xa0\xd7\xa0Source document.</div>'
+            "</body></html>"
+        )
+        ej = extract_judgment(html, "x")
+        para = ej.fragments[0]
+        fn_texts = json.loads(para["footnote_text"])
+        assert all("\xa0" not in t for t in fn_texts)
+
+
+# ---------------------------------------------------------------------------
+# extraction_cache corruption handling
+# ---------------------------------------------------------------------------
+
+
+class TestExtractionCacheCorruption:
+    """Corrupt cache files must not raise — they get quarantined + treated as miss."""
+
+    def _with_temp_cache(self, monkeypatch, tmp_path):
+        """Point extraction_cache at a temp directory for test isolation."""
+        import resources.extraction_cache as ec
+
+        monkeypatch.setattr(ec, "CACHE_ROOT", tmp_path)
+        monkeypatch.setattr(ec, "HTML_DIR", tmp_path / "judgments_html")
+        monkeypatch.setattr(ec, "EXTRACTIONS_DIR", tmp_path / "judgments_extractions")
+        return ec
+
+    def test_corrupt_json_quarantined_and_returns_none(self, monkeypatch, tmp_path):
+        ec = self._with_temp_cache(monkeypatch, tmp_path)
+        ec.EXTRACTIONS_DIR.mkdir(parents=True, exist_ok=True)
+        path = ec.extraction_path("abc123")
+        path.write_text("{ not valid json", encoding="utf-8")
+
+        assert ec.read_extraction("abc123") is None
+        # Original file renamed out of the way; a corrupt-* file exists.
+        assert not path.exists()
+        siblings = list(ec.EXTRACTIONS_DIR.iterdir())
+        assert any(".corrupt-" in s.name for s in siblings)
+
+    def test_corrupt_gzip_quarantined_and_returns_none(self, monkeypatch, tmp_path):
+        ec = self._with_temp_cache(monkeypatch, tmp_path)
+        ec.HTML_DIR.mkdir(parents=True, exist_ok=True)
+        path = ec.html_path("abc123")
+        # Not a gzip — gzip.open will raise OSError on read.
+        path.write_bytes(b"not actually gzipped")
+
+        assert ec.read_html("abc123") is None
+        assert not path.exists()
+        siblings = list(ec.HTML_DIR.iterdir())
+        assert any(".corrupt-" in s.name for s in siblings)
+
+    def test_missing_file_returns_none_without_quarantine(self, monkeypatch, tmp_path):
+        ec = self._with_temp_cache(monkeypatch, tmp_path)
+        assert ec.read_extraction("never-existed") is None
+        assert ec.read_html("never-existed") is None
