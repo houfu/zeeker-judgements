@@ -213,13 +213,17 @@ def summarise(
     client,
     *,
     timeout: float = 120.0,
-    max_tokens: int = 220,
+    max_tokens: int = 512,
     temperature: float = 0.2,
 ) -> str:
     """Single LLM call → trimmed summary paragraph.
 
-    ``max_tokens=220`` gives comfortable headroom above a 100-word
-    paragraph (~150 tokens). ``temperature=0.2`` keeps the paragraph
+    ``max_tokens=512`` gives headroom above a 100-word paragraph
+    (~150 tokens) and accommodates thinking models (e.g. Gemma4:26b)
+    where reasoning tokens can consume the original 220-token budget
+    entirely, leaving empty content. ``think=False`` via ``extra_body``
+    disables chain-of-thought for Ollama thinking models — summaries
+    don't need extended reasoning. ``temperature=0.2`` keeps output
     information-dense rather than creative. Raises whatever the OpenAI
     SDK raises — the caller (``_summarise_row``) handles retry /
     quarantine.
@@ -233,9 +237,13 @@ def summarise(
         max_tokens=max_tokens,
         temperature=temperature,
         timeout=timeout,
+        extra_body={"think": False},
     )
     choice = response.choices[0]
     content = getattr(choice.message, "content", "") or ""
+    if not content:
+        finish_reason = getattr(choice, "finish_reason", "unknown")
+        raise ValueError(f"LLM returned empty content (finish_reason={finish_reason})")
     return content.strip()
 
 
