@@ -40,24 +40,3 @@ fragment_count = "Number of rows in judgments_fragments for this judgment."
 extracted_at = "ISO 8601 timestamp when Phase 2 enrichment ran for this row."
 summary_generated_at = "ISO 8601 timestamp when Phase 3 generated this summary."
 created_at = "ISO 8601 timestamp when the record was first imported (Phase 1)."
-
-[resource.judgments_fragments]
-description = "One row per Judg-* element in each judgment's detail HTML — numbered paragraphs, sub-paragraphs, headings, quotes, lists, author/date front matter. Tables and figures are absorbed into their parent paragraph per CLAUDE.md's attachment rule."
-facets = ["class_name", "has_table", "has_figure", "has_footnotes"]
-sort = "id"
-
-[resource.judgments_fragments.columns]
-id = "Deterministic PK: {judgment_id}_{ordinal:04d}."
-judgment_id = "FK-style reference to judgments.id. Not a foreign key constraint (sqlite), but semantically one."
-ordinal = "0-based document-order position within the judgment's divJudgement. Fragments sorted by ordinal reconstitute the original reading order."
-paragraph_number = "Arabic paragraph number for Judg-1/Judg-1-firstpara elements. NULL for headings, Judg-2 (alpha enumeration), Judg-3 (roman), and front-matter fragments."
-class_name = "The original CSS class from eLitigation, e.g. Judg-1, Judg-Heading-3, Judg-Quote-1. Preserves structural role for rendering and filtering."
-section_heading = "Text of the nearest Judg-Heading-* element above this fragment, giving search hits context. NULL for fragments that precede any heading."
-content_text = "Plain-text paragraph content, with absorbed table cells rendered pipe-separated between ---table---/---end-table--- markers and figure alt-text appended."
-html_raw = "Outer-HTML of the original Judg-* element, preserved verbatim so re-extraction or richer rendering doesn't require re-crawling."
-footnote_text = "JSON array of footnote body texts referenced by <sup> markers in this paragraph. NULL when no footnotes are referenced."
-has_footnotes = "Derived from footnote_text; convenience for faceting."
-has_table = "True if the paragraph contains or absorbed a <table>."
-has_figure = "True if the paragraph contains or absorbed an <img>."
-figure_src = "JSON array of image src attributes (URL, or sha256:<hex> placeholder for data: URIs). Positional match with figure_descriptions."
-figure_descriptions = "JSON array of alt-text per figure. Placeholder like '[Figure, 1024x768]' when the source markup omits alt text."
