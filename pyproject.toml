@@ -9,6 +9,7 @@ dependencies = [
     "click>=8.3.2",
     "httpx>=0.28.1",
     "lxml>=6.0.4",
+    "openai>=1.50",
     "tenacity>=9.1.4",
     "zeeker>=0.6.0",
 ]

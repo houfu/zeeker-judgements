@@ -115,8 +115,13 @@ When implementing resources that need external libraries:
   Fragments are inserted inline from `fetch_data` (not via
   `fetch_fragments_data`, which is a no-op stub); see the "Implementation
   notes" subsection below for the why.
-- **Phase 3 (not yet implemented):** AI summaries — populate `summary`
-  using an OpenAI-compatible LLM endpoint.
+- **Phase 3 (DONE):** AI summaries — populates `summary` with a single
+  ≤100-word paragraph via an OpenAI-compatible LLM endpoint. Runs in the
+  **same** `fetch_data()` invocation after Phase 2, so one
+  `zeeker build judgments` drains all three backlogs on a single pass.
+  Skips gracefully when `LLM_BASE_URL` is unset (local-first — no cloud
+  dependency required). Default cap is 15 docs per build; see "Phase 3
+  implementation notes" below.
 - **Deployment (deferred):** No S3 workflow wired up yet. The
   auto-generated `.github/workflows/deploy.yml` is inert until secrets are
   configured.
@@ -285,10 +290,67 @@ sketch once we hit real code. Future-you should know about these:
 entirely (useful during the initial Phase-1 archive crawl). The rest are
 in the knob table below.
 
+### Phase 3 implementation notes
+
+Phase 3 mirrors Phase 2's shape: batch-limited backfill, checkpointed
+failure tracking, disk cache for crash recovery, env-var sentinel to
+survive zeeker's module reload. The deltas worth knowing:
+
+1. **The skill's naive `text[:4000]` truncation throws away the
+   holding.** The zeeker-source-creator skill's suggested summariser
+   template truncates the content blindly. The holding of a judgment
+   usually lives at the end, so we replaced truncation with
+   fragment-weighted sampling in `resources/summarization.py`:
+   - **Always keep:** `court_summary` (if non-empty), every
+     `Judg-Heading-*`, the first numbered paragraph (smallest
+     `paragraph_number`), and the last three numbered paragraphs
+     (largest).
+   - **Scored remainder:** `+2` for `has_footnotes`, `+3` for a
+     dispositive heading (conclusion/decision/holding/disposition/
+     order), `+1.5` for analysis/issue/reasoning, `+0.5` for
+     `has_table`, plus a capped length bonus (up to `+0.5`).
+   - Pack highest-scored fragments into whatever char budget remains
+     after the always-keep set, then re-emit everything in document
+     order. Fallback for rows with zero fragments: send
+     `content_text[:SUMMARY_MAX_INPUT_CHARS]`.
+
+2. **Local-first by default.** If `LLM_BASE_URL` is unset,
+   `summarization.make_client()` returns `None` and `_run_phase3` logs
+   "LLM not configured — skipping" without importing openai. `LLM_API_KEY`
+   defaults to `"not-needed"` so Ollama / vLLM work out of the box.
+
+3. **Direct `UPDATE` + ad-hoc column add (same pattern as Phase 2).**
+   `_ensure_phase3_columns` only adds `summary_generated_at`; the
+   `summary` column is created during Phase 1 (initialised to NULL in
+   `parse_listing_page`). Writes go through `_update_row` because zeeker
+   didn't declare a primary key on `judgments`.
+
+4. **Env-var sentinel (`_JUDGMENTS_PHASE3_RAN_PID`) guards the module
+   reload.** Identical mechanism to Phase 2 — without it every build
+   would summarise `2 × SUMMARY_MAX_PER_RUN` docs.
+
+5. **Cache under `.cache/judgments_summaries/{id}.json`.** Survives
+   crashes after the LLM call but before the DB `UPDATE`. If parsing/
+   prompting rules change, delete the JSONs and reset the rows' `summary`
+   column to NULL to force regeneration. Atomic writes via tmp +
+   `os.replace`; corrupt JSON is quarantined (renamed aside) so the next
+   run regenerates.
+
+6. **Query candidates via `has_content = 1 AND summary IS NULL`.** Don't
+   summarise rows that Phase 2 hasn't enriched yet (no body text = no
+   useful input). The real progress signal is exactly this SQL, same as
+   Phase 2's `content_text IS NULL` signal.
+
+7. **Phase 3 lives outside the `with create_client() as client:` block**
+   in `fetch_data`. The LLM call goes through its own OpenAI-compatible
+   client, not the eLitigation connection pool — keeping them separate
+   means a flaky Phase 2 source doesn't break summarisation and vice
+   versa.
+
 ### Environment variables
 Phase 1 + 2 need **none** for correctness — both are public-HTML crawls
-reusing the same `httpx.Client`. See `.env.example` for the variables
-that light up in Phase 3 / deployment.
+reusing the same `httpx.Client`. Phase 3 needs `LLM_BASE_URL` to do
+anything; without it Phase 3 skips gracefully. See `.env.example`.
 
 The resource has a handful of operational knobs that default via env
 vars (handy for smoke tests — no code edits required):
@@ -305,6 +367,14 @@ vars (handy for smoke tests — no code edits required):
 | `JUDGMENTS_EXTRACT_RETRY_AFTER` | `86400` | Phase 2: quarantine TTL in seconds (default 24h). |
 | `JUDGMENTS_EXTRACT_DELAY_BASE` | `1.5` | Phase 2: base sleep (s) between detail-page fetches. |
 | `JUDGMENTS_EXTRACT_DELAY_JITTER` | `0.5` | Phase 2: +/- jitter on the sleep. |
+| `JUDGMENTS_SUMMARY_ENABLED` | `1` | Phase 3: set to `0` to skip summarisation. |
+| `JUDGMENTS_SUMMARY_MAX_PER_RUN` | `15` | Phase 3: max docs summarised per `zeeker build`. |
+| `JUDGMENTS_SUMMARY_MAX_RETRIES` | `3` | Phase 3: failures before a doc is quarantined. |
+| `JUDGMENTS_SUMMARY_RETRY_AFTER` | `86400` | Phase 3: quarantine TTL in seconds (default 24h). |
+| `JUDGMENTS_SUMMARY_MAX_INPUT_CHARS` | `32000` | Phase 3: char budget for composed LLM input (~8K tokens). |
+| `LLM_BASE_URL` | *unset* | Phase 3: OpenAI-compatible endpoint. Unset → Phase 3 skips. |
+| `LLM_API_KEY` | `not-needed` | Phase 3: optional for local servers; required for cloud. |
+| `LLM_MODEL` | `llama3.1:8b` | Phase 3: any model the endpoint accepts. |
 
 ### Operational notes
 - **Phase 1 checkpointing:** state lives in

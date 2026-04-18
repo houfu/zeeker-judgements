@@ -85,6 +85,8 @@ from tenacity import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import extraction  # noqa: E402
 import extraction_cache  # noqa: E402
+import summarization  # noqa: E402
+import summary_cache  # noqa: E402
 from extraction import ExtractionError  # noqa: E402
 
 # =============================================================================
@@ -115,6 +117,7 @@ CIRCUIT_BREAKER_COOLDOWN = 60.0
 # State
 CHECKPOINT_FILE = Path("checkpoint_judgments_discovery.json")
 EXTRACTION_CHECKPOINT_FILE = Path("checkpoint_judgments_extraction.json")
+SUMMARY_CHECKPOINT_FILE = Path("checkpoint_judgments_summary.json")
 
 # Phase 2 knobs
 EXTRACT_ENABLED = os.environ.get("JUDGMENTS_EXTRACT_ENABLED", "1") == "1"
@@ -124,10 +127,18 @@ EXTRACT_RETRY_AFTER = int(os.environ.get("JUDGMENTS_EXTRACT_RETRY_AFTER", "86400
 EXTRACT_DELAY_BASE = float(os.environ.get("JUDGMENTS_EXTRACT_DELAY_BASE", "1.5"))
 EXTRACT_DELAY_JITTER = float(os.environ.get("JUDGMENTS_EXTRACT_DELAY_JITTER", "0.5"))
 
+# Phase 3 knobs
+SUMMARY_ENABLED = os.environ.get("JUDGMENTS_SUMMARY_ENABLED", "1") == "1"
+SUMMARY_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_PER_RUN", "15"))
+SUMMARY_MAX_RETRIES = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_RETRIES", "3"))
+SUMMARY_RETRY_AFTER = int(os.environ.get("JUDGMENTS_SUMMARY_RETRY_AFTER", "86400"))
+SUMMARY_MAX_INPUT_CHARS = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_INPUT_CHARS", "32000"))
+
 # Per-process sentinel so Phase 2 runs ONCE per build even though zeeker
 # reloads this module and re-calls fetch_data to populate fragment context.
 # Module-level vars don't survive the reload; env vars do (same process).
 _PHASE2_SENTINEL_ENV = "_JUDGMENTS_PHASE2_RAN_PID"
+_PHASE3_SENTINEL_ENV = "_JUDGMENTS_PHASE3_RAN_PID"
 
 # Per-process cache — zeeker's fragment build flow may call fetch_data twice
 # (once for main-table insert, once to provide main_data_context for fragments).
@@ -437,6 +448,13 @@ PHASE2_ADDED_COLUMNS = {
     "has_court_summary": int,
     "fragment_count": int,
     "extracted_at": str,
+}
+
+# Phase 3 column additions. ``summary`` is already present from Phase 1
+# (initialized to NULL in ``parse_listing_page``), so only the timestamp
+# is genuinely new.
+PHASE3_ADDED_COLUMNS = {
+    "summary_generated_at": str,
 }
 
 FRAGMENT_COLUMNS = {
@@ -749,6 +767,236 @@ def _run_phase2(
 
 
 # =============================================================================
+# PHASE 3 — AI SUMMARIES (helpers)
+# =============================================================================
+# Summary checkpoint mirrors the Phase 2 shape so the helper code stays
+# symmetric. Duplication (load/save/record/clear/is_quarantined) is
+# preferred over a generic abstraction because the two phases already
+# diverge on a few small things (error sources, quarantine messages,
+# column names) and the extra shared-code ceremony outweighs the savings.
+
+
+def load_summary_state() -> dict:
+    if SUMMARY_CHECKPOINT_FILE.exists():
+        try:
+            return json.loads(SUMMARY_CHECKPOINT_FILE.read_text())
+        except json.JSONDecodeError:
+            click.echo("Summary checkpoint was corrupt — starting fresh.", err=True)
+    return {"failures": {}}
+
+
+def save_summary_state(state: dict) -> None:
+    tmp = SUMMARY_CHECKPOINT_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, default=str))
+    os.replace(tmp, SUMMARY_CHECKPOINT_FILE)
+
+
+def _record_summary_failure(state: dict, jid: str, err: Exception) -> None:
+    failures = state.setdefault("failures", {})
+    entry = failures.setdefault(jid, {"count": 0, "last_error": "", "last_attempt": ""})
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["last_error"] = f"{type(err).__name__}: {err}"[:500]
+    entry["last_attempt"] = datetime.now().isoformat(timespec="seconds")
+
+
+def _clear_summary_failure(state: dict, jid: str) -> None:
+    failures = state.get("failures", {})
+    if jid in failures:
+        del failures[jid]
+
+
+def _is_summary_quarantined(state: dict, jid: str, now: datetime) -> bool:
+    entry = state.get("failures", {}).get(jid)
+    if entry is None:
+        return False
+    if int(entry.get("count", 0)) < SUMMARY_MAX_RETRIES:
+        return False
+    last_attempt_str = entry.get("last_attempt") or ""
+    try:
+        last_attempt = datetime.fromisoformat(last_attempt_str)
+    except ValueError:
+        return False
+    return (now - last_attempt).total_seconds() < SUMMARY_RETRY_AFTER
+
+
+def _ensure_phase3_columns(table: Table) -> None:
+    existing = set(table.columns_dict)
+    for name, col_type in PHASE3_ADDED_COLUMNS.items():
+        if name not in existing:
+            table.add_column(name, col_type)
+
+
+def _summarise_row(
+    row: Dict[str, Any],
+    existing_table: Table,
+    client,
+    model: str,
+) -> Tuple[str, Optional[str]]:
+    """Generate + persist a summary for one row. Returns ``(status, detail)``.
+
+    Status is one of: ``ok``, ``cached`` (re-used disk cache from a
+    previous crashed-mid-run), or ``error`` (LLM failure; caller bumps
+    failure counter).
+    """
+    jid = row["id"]
+
+    # Fast path: previous run wrote the cache but crashed before the DB
+    # UPDATE. Push to DB without calling the LLM again.
+    cached = summary_cache.read_summary(jid)
+    if cached is not None and cached.get("summary"):
+        _update_row(
+            existing_table,
+            jid,
+            {
+                "summary": cached["summary"],
+                "summary_generated_at": cached.get("generated_at")
+                or datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        return "cached", None
+
+    fragments = (
+        list(
+            existing_table.db[FRAGMENTS_TABLE_NAME].rows_where(
+                "judgment_id = ?", [jid], order_by="ordinal"
+            )
+        )
+        if FRAGMENTS_TABLE_NAME in existing_table.db.table_names()
+        else []
+    )
+
+    input_text = summarization.compose_summary_input(
+        row, fragments, max_chars=SUMMARY_MAX_INPUT_CHARS
+    )
+    if not input_text.strip():
+        return "error", "empty input"
+
+    try:
+        summary_text = summarization.summarise(input_text, model, client)
+    except Exception as exc:
+        return "error", f"{type(exc).__name__}: {exc}"
+
+    if not summary_text:
+        return "error", "empty response"
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    endpoint = os.environ.get("LLM_BASE_URL", "")
+    summary_cache.write_summary_atomic(
+        jid,
+        {
+            "judgment_id": jid,
+            "generated_at": now_iso,
+            "model": model,
+            "endpoint": endpoint,
+            "input_chars": len(input_text),
+            "frags_kept": input_text.count("\n\n") + 1,
+            "summary": summary_text,
+        },
+    )
+    _update_row(
+        existing_table,
+        jid,
+        {"summary": summary_text, "summary_generated_at": now_iso},
+    )
+    return "ok", f"{len(summary_text)} chars"
+
+
+def _run_phase3(existing_table: Optional[Table]) -> None:
+    if not SUMMARY_ENABLED:
+        click.echo("Phase 3: disabled (JUDGMENTS_SUMMARY_ENABLED=0) — skipping.")
+        return
+    if existing_table is None:
+        return
+    if os.environ.get(_PHASE3_SENTINEL_ENV) == str(os.getpid()):
+        click.echo("Phase 3: already ran this build (fragment-context pass) — skipping.")
+        return
+    os.environ[_PHASE3_SENTINEL_ENV] = str(os.getpid())
+
+    client = summarization.make_client()
+    if client is None:
+        click.echo("Phase 3: LLM not configured (LLM_BASE_URL unset) — skipping.")
+        return
+
+    _ensure_phase3_columns(existing_table)
+    model = summarization.resolve_model()
+
+    state = load_summary_state()
+    now = datetime.now()
+
+    candidates: List[Dict[str, Any]] = list(
+        existing_table.rows_where(
+            "has_content = 1 AND summary IS NULL",
+            order_by="decision_date DESC",
+        )
+    )
+    remaining_total = len(candidates)
+    if remaining_total == 0:
+        click.echo("Phase 3: no rows need summarisation.")
+        return
+
+    click.echo(
+        f"Phase 3: summarising up to {SUMMARY_MAX_PER_RUN} / {remaining_total} "
+        f"remaining (model={model}, max_chars={SUMMARY_MAX_INPUT_CHARS})"
+    )
+
+    successes = 0
+    cached_hits = 0
+    failures = 0
+    skipped_quarantined = 0
+    attempted = 0
+
+    try:
+        for row in candidates:
+            if attempted >= SUMMARY_MAX_PER_RUN:
+                break
+            jid = row["id"]
+            if _is_summary_quarantined(state, jid, now):
+                skipped_quarantined += 1
+                continue
+            attempted += 1
+            label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
+            try:
+                status, detail = _summarise_row(row, existing_table, client, model)
+            except Exception as exc:  # defensive
+                failures += 1
+                _record_summary_failure(state, jid, exc)
+                click.echo(
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label} → UNEXPECTED: {exc}",
+                    err=True,
+                )
+                save_summary_state(state)
+                continue
+
+            if status == "ok":
+                successes += 1
+                _clear_summary_failure(state, jid)
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label} → {detail}")
+            elif status == "cached":
+                cached_hits += 1
+                _clear_summary_failure(state, jid)
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label} → cached")
+            else:  # error
+                failures += 1
+                fake = RuntimeError(detail or "llm error")
+                _record_summary_failure(state, jid, fake)
+                click.echo(
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label} → llm failed: {detail}",
+                    err=True,
+                )
+            save_summary_state(state)
+    except KeyboardInterrupt:
+        click.echo("Phase 3 interrupted — state saved", err=True)
+        save_summary_state(state)
+        raise
+
+    click.echo(
+        f"Phase 3 complete: {successes} summarised, {cached_hits} from cache, "
+        f"{failures} failed, {skipped_quarantined} quarantined; "
+        f"{remaining_total - successes - cached_hits} NULL-summary rows remain."
+    )
+
+
+# =============================================================================
 # PHASE 1 — DISCOVERY
 # =============================================================================
 def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
@@ -902,6 +1150,11 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         # connection pool. Uses the breaker state from Phase 1 — if the
         # source was flaky during discovery we skip enrichment entirely.
         _run_phase2(client, existing_table, breaker)
+
+    # Phase 3 lives outside the httpx client block — the LLM call goes
+    # through its own OpenAI-compatible client, not the eLitigation
+    # connection pool.
+    _run_phase3(existing_table)
 
     _FETCH_CACHE = staged
     return staged

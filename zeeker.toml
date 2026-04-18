@@ -8,7 +8,7 @@ license_url = "https://www.elitigation.sg/gd/"
 source = "https://www.elitigation.sg/gd/"
 
 [resource.judgments]
-description = "Singapore court judgments — catalog metadata (Phase 1) plus full judgment text and court-authored summary (Phase 2). Paragraph-level fragments live in judgments_fragments."
+description = "Singapore court judgments — catalog metadata (Phase 1), full judgment text and court-authored summary (Phase 2), and AI-generated single-paragraph summaries (Phase 3). Paragraph-level fragments live in judgments_fragments."
 facets = ["court", "decision_date", "has_content"]
 sort = "decision_date desc"
 size = 25
@@ -33,11 +33,12 @@ source_url = "URL to the judgment HTML on eLitigation."
 pdf_url = "URL to the authoritative PDF version at /gd/gd/{citation}/pdf (percent-encoded). Stored as a reference to the legally authoritative format; Phase 2 extraction uses the HTML at source_url instead."
 content_text = "Full judgment body text, composed from the numbered paragraphs and headings in div#divJudgement. Populated by Phase 2. NULL means 'not yet extracted'; empty string means 'extraction ran but the detail page had no extractable body' (see has_content)."
 court_summary = "Court-authored summary from div#divCaseSummary when present (often empty). Populated by Phase 2."
-summary = "AI-generated summary highlighting key legal points. NULL until Phase 3."
+summary = "AI-generated paragraph (≤100 words) highlighting the court, parties, issues, holding, and cited precedents. Populated by Phase 3 from an OpenAI-compatible LLM endpoint (e.g. Ollama). NULL until Phase 3 runs for this row."
 has_content = "True if Phase 2 extraction produced a non-empty judgment body; False if the source page had no divJudgement body. Lets Datasette filters distinguish 'extraction succeeded' from 'not yet extracted' (content_text IS NULL)."
 has_court_summary = "True if the source page's divCaseSummary was non-empty."
 fragment_count = "Number of rows in judgments_fragments for this judgment."
 extracted_at = "ISO 8601 timestamp when Phase 2 enrichment ran for this row."
+summary_generated_at = "ISO 8601 timestamp when Phase 3 generated this summary."
 created_at = "ISO 8601 timestamp when the record was first imported (Phase 1)."
 
 [resource.judgments_fragments]
