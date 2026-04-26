@@ -18,8 +18,8 @@ size = 25
 # The on-disk extraction cache under .cache/ is the source of truth that
 # survives zeeker's module reload between main-table and fragment phases.
 fragments = true
-fts_fields = ["case_name", "content_text", "court_summary"]
-fragments_fts_fields = ["content_text", "section_heading"]
+fts_fields = ["case_name", "summary", "court_summary"]
+fragments_fts_fields = ["content_text"]
 
 [resource.judgments.columns]
 id = "Opaque SHA-256 hash of source_url (first 12 hex chars). Stable identifier for deduplication."
