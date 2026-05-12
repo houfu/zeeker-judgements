@@ -865,14 +865,8 @@ def _summarise_row(
         else []
     )
 
-    input_text = summarization.compose_summary_input(
-        row, fragments, max_chars=SUMMARY_MAX_INPUT_CHARS
-    )
-    if not input_text.strip():
-        return "error", "empty input"
-
     try:
-        summary_text = summarization.summarise(input_text, model, client)
+        summary_text = summarization.rolling_summarise(row, fragments, model, client)
     except Exception as exc:
         return "error", f"{type(exc).__name__}: {exc}"
 
@@ -888,8 +882,7 @@ def _summarise_row(
             "generated_at": now_iso,
             "model": model,
             "endpoint": endpoint,
-            "input_chars": len(input_text),
-            "frags_kept": input_text.count("\n\n") + 1,
+            "frags_total": len(fragments),
             "summary": summary_text,
         },
     )
@@ -989,6 +982,7 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         save_summary_state(state)
         raise
 
+    save_summary_state(state)
     click.echo(
         f"Phase 3 complete: {successes} summarised, {cached_hits} from cache, "
         f"{failures} failed, {skipped_quarantined} quarantined; "
@@ -1123,7 +1117,11 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                         page_new += 1
 
                 click.echo(f"  → {page_new}/{len(items)} new on page {page}")
-                save_checkpoint(_snapshot(page))
+                if not steady_state:
+                    # Steady-state already cleared the checkpoint above; don't
+                    # immediately recreate it with the current page or the
+                    # next run resumes mid-archive instead of from page 1.
+                    save_checkpoint(_snapshot(page))
 
                 if steady_state:
                     break
