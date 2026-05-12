@@ -215,8 +215,7 @@ def rolling_summarise(
     # Dynamic limit based on actual rendered fragment count.
     n_frags = row.get("fragment_count") or len(frag_texts)
     limit = max_summary_chars(n_frags)
-    # max_tokens per call: generous headroom, capped at 4096.
-    call_max_tokens = min(4096, max(1500, limit // 3))
+    call_max_tokens = 4096
 
     batches = [frag_texts[i : i + batch_size] for i in range(0, len(frag_texts), batch_size)]
     summary = ""
