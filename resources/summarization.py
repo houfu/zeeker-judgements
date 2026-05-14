@@ -256,6 +256,12 @@ def rolling_summarise(
             max_tokens=call_max_tokens,
             timeout=timeout,
         )
+        # Prevent uncapped growth: _call_once returns partial content on finish_reason=length.
+        # Without this guard, accumulated summary can reach 5k–20k tokens → overflows num_ctx
+        # in the sanity-check pass (input=0 output tokens, content="", finish_reason=length).
+        if len(summary) > limit:
+            trimmed = summary[:limit].rsplit(". ", 1)
+            summary = (trimmed[0] + ".") if len(trimmed) > 1 else summary[:limit]
 
     # Pass 2: sanity check — strip Python-side artefacts first.
     cleaned = _META_PREFIX_RE.sub("", summary).strip()
