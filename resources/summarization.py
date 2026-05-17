@@ -215,6 +215,9 @@ _MAX_BATCHES = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_BATCHES", "20"))
 # Alt-model passes: fewer, wider batches — more fragments per call, fewer
 # rolling steps. DeepSeek V4 Flash handles ~50–100 frags/call comfortably.
 _MAX_BATCHES_ALT = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_BATCHES_ALT", "5"))
+# Alt-model output token floor — raised above 4096 so wide-batch intermediate
+# summaries have headroom. Also covers thinking tokens if the alt model uses them.
+_MAX_TOKENS_ALT = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_TOKENS_ALT", "8192"))
 
 
 def rolling_summarise(
@@ -225,6 +228,7 @@ def rolling_summarise(
     *,
     batch_size: int = 10,
     max_batches: int = _MAX_BATCHES,
+    call_max_tokens_override: int = 0,
     timeout: float = 300.0,
 ) -> str:
     """Two-pass rolling summariser. See module docstring for design notes.
@@ -251,7 +255,8 @@ def rolling_summarise(
     limit = max_summary_chars(n_frags)
     # Scale token budget with the char limit — Gemma4:26b uses ~2 chars/token.
     # Add 1024 overhead for thinking tokens that count against the same budget.
-    call_max_tokens = max(4096, limit // 2 + 1024)
+    # call_max_tokens_override lets the alt model raise its floor independently.
+    call_max_tokens = call_max_tokens_override or max(4096, limit // 2 + 1024)
 
     # Cap at _MAX_BATCHES by widening batch_size for large docs.  For a
     # 957-frag judgment the default batch_size=10 yields 96 batches; with the

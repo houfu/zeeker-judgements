@@ -139,6 +139,17 @@ SUMMARY_MAX_INPUT_CHARS = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_INPUT_CHARS"
 # Module-level vars don't survive the reload; env vars do (same process).
 _PHASE2_SENTINEL_ENV = "_JUDGMENTS_PHASE2_RAN_PID"
 _PHASE3_SENTINEL_ENV = "_JUDGMENTS_PHASE3_RAN_PID"
+_PHASE3_PROGRESS_FILE = Path(__file__).parent.parent / "phase3_progress.jsonl"
+
+
+def _phase3_log(entry: dict) -> None:
+    """Append one JSON line to the Phase 3 progress file (for real-time monitoring)."""
+    try:
+        with open(_PHASE3_PROGRESS_FILE, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+    except OSError:
+        pass
 
 # Per-process cache — zeeker's fragment build flow may call fetch_data twice
 # (once for main-table insert, once to provide main_data_context for fragments).
@@ -838,6 +849,7 @@ def _summarise_row(
     *,
     endpoint: str = "",
     max_batches: int = summarization._MAX_BATCHES,
+    call_max_tokens_override: int = 0,
 ) -> Tuple[str, Optional[str]]:
     """Generate + persist a summary for one row. Returns ``(status, detail)``.
 
@@ -874,7 +886,9 @@ def _summarise_row(
 
     try:
         summary_text = summarization.rolling_summarise(
-            row, fragments, model, client, max_batches=max_batches
+            row, fragments, model, client,
+            max_batches=max_batches,
+            call_max_tokens_override=call_max_tokens_override,
         )
     except Exception as exc:
         return "error", f"{type(exc).__name__}: {exc}"
@@ -945,6 +959,8 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         f"Phase 3: summarising up to {SUMMARY_MAX_PER_RUN} / {remaining_total} "
         f"remaining (model={model}{alt_info}, max_chars={SUMMARY_MAX_INPUT_CHARS})"
     )
+    _phase3_log({"event": "start", "ts": datetime.now().isoformat(timespec="seconds"),
+                 "remaining": remaining_total, "model": model, "alt_model": model_alt or None})
 
     successes = 0
     cached_hits = 0
@@ -979,6 +995,7 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                     use_model,
                     endpoint=use_endpoint,
                     max_batches=max_batches_alt if use_alt else summarization._MAX_BATCHES,
+                    call_max_tokens_override=summarization._MAX_TOKENS_ALT if use_alt else 0,
                 )
             except Exception as exc:  # defensive
                 failures += 1
@@ -987,6 +1004,12 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                     f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → UNEXPECTED: {exc}",
                     err=True,
                 )
+                _phase3_log({
+                    "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
+                    "n": attempted, "id": jid,
+                    "citation": row.get("citation"), "court": row.get("court"),
+                    "status": "error", "detail": f"UNEXPECTED: {exc}", "alt": use_alt,
+                })
                 save_summary_state(state)
                 continue
 
@@ -1006,6 +1029,12 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                     f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → llm failed: {detail}",
                     err=True,
                 )
+            _phase3_log({
+                "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
+                "n": attempted, "id": jid,
+                "citation": row.get("citation"), "court": row.get("court"),
+                "status": status, "detail": detail, "alt": use_alt,
+            })
             save_summary_state(state)
     except KeyboardInterrupt:
         click.echo("Phase 3 interrupted — state saved", err=True)
