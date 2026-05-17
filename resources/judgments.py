@@ -501,6 +501,10 @@ def _ensure_fragments_table(db) -> Table:
     """
     if FRAGMENTS_TABLE_NAME not in db.table_names():
         db[FRAGMENTS_TABLE_NAME].create(FRAGMENT_COLUMNS, pk="id")
+    db.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{FRAGMENTS_TABLE_NAME}_judgment_id"
+        f" ON {FRAGMENTS_TABLE_NAME}(judgment_id)"
+    )
     return db[FRAGMENTS_TABLE_NAME]
 
 
